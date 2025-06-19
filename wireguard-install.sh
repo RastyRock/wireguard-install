@@ -6,19 +6,21 @@
 
 
 # Detect Debian users running the script with "sh" instead of bash
+#!/bin/bash
+#
+# https://github.com/Nyr/wireguard-install
+#
+# Copyright (c) 2020 Nyr. Released under the MIT License.
+
+
+# Detect Debian users running the script with "sh" instead of bash
 if readlink /proc/$$/exe | grep -q "dash"; then
 	echo 'This installer needs to be run with "bash", not "sh".'
 	exit
 fi
 
-# Discard stdin. Needed when running from an one-liner which includes a newline
+# Discard stdin. Needed when running from a one-liner which includes a newline
 read -N 999999 -t 0.001
-
-# Detect OpenVZ 6
-if [[ $(uname -r | cut -d "." -f 1) -eq 2 ]]; then
-	echo "The system is running an old kernel, which is incompatible with this installer."
-	exit
-fi
 
 # Detect OS
 # $os_version variables aren't always in use, but are kept here for convenience
@@ -40,21 +42,28 @@ Supported distros are Ubuntu, Debian, AlmaLinux, Rocky Linux, CentOS and Fedora.
 	exit
 fi
 
-if [[ "$os" == "ubuntu" && "$os_version" -lt 1804 ]]; then
-	echo "Ubuntu 18.04 or higher is required to use this installer.
+if [[ "$os" == "ubuntu" && "$os_version" -lt 2204 ]]; then
+	echo "Ubuntu 22.04 or higher is required to use this installer.
 This version of Ubuntu is too old and unsupported."
 	exit
 fi
 
-if [[ "$os" == "debian" && "$os_version" -lt 10 ]]; then
-	echo "Debian 10 or higher is required to use this installer.
+if [[ "$os" == "debian" ]]; then
+	if grep -q '/sid' /etc/debian_version; then
+		echo "Debian Testing and Debian Unstable are unsupported by this installer."
+		exit
+	fi
+	if [[ "$os_version" -lt 11 ]]; then
+		echo "Debian 11 or higher is required to use this installer.
 This version of Debian is too old and unsupported."
-	exit
+		exit
+	fi
 fi
 
-if [[ "$os" == "centos" && "$os_version" -lt 7 ]]; then
-	echo "CentOS 7 or higher is required to use this installer.
-This version of CentOS is too old and unsupported."
+if [[ "$os" == "centos" && "$os_version" -lt 9 ]]; then
+	os_name=$(sed 's/ release.*//' /etc/almalinux-release /etc/rocky-release /etc/centos-release 2>/dev/null | head -1)
+	echo "$os_name 9 or higher is required to use this installer.
+This version of $os_name is too old and unsupported."
 	exit
 fi
 
@@ -64,13 +73,16 @@ if ! grep -q sbin <<< "$PATH"; then
 	exit
 fi
 
-systemd-detect-virt -cq
-is_container="$?"
-
-if [[ "$os" == "fedora" && "$os_version" -eq 31 && $(uname -r | cut -d "." -f 2) -lt 6 && ! "$is_container" -eq 0 ]]; then
-	echo 'Fedora 31 is supported, but the kernel is outdated.
-Upgrade the kernel using "dnf upgrade kernel" and restart.'
-	exit
+# Detect if BoringTun (userspace WireGuard) needs to be used
+if ! systemd-detect-virt -cq; then
+	# Not running inside a container
+	use_boringtun="0"
+elif grep -q '^wireguard ' /proc/modules; then
+	# Running inside a container, but the wireguard kernel module is available
+	use_boringtun="0"
+else
+	# Running inside a container and the wireguard kernel module is not available
+	use_boringtun="1"
 fi
 
 if [[ "$EUID" -ne 0 ]]; then
@@ -78,13 +90,14 @@ if [[ "$EUID" -ne 0 ]]; then
 	exit
 fi
 
-if [[ "$is_container" -eq 0 ]]; then
+if [[ "$use_boringtun" -eq 1 ]]; then
 	if [ "$(uname -m)" != "x86_64" ]; then
-		echo "In containerized systems, this installer supports only the x86_64 architecture.
+		echo "In containerized systems without the wireguard kernel module, this installer
+supports only the x86_64 architecture.
 The system runs on $(uname -m) and is unsupported."
 		exit
 	fi
-	# TUN device is required to use BoringTun if running inside a container
+	# TUN device is required to use BoringTun
 	if [[ ! -e /dev/net/tun ]] || ! ( exec 7<>/dev/net/tun ) 2>/dev/null; then
 		echo "The system does not have the TUN device available.
 TUN needs to be enabled before running this installer."
@@ -92,31 +105,34 @@ TUN needs to be enabled before running this installer."
 	fi
 fi
 
+# Store the absolute path of the directory where the script is located
+script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 new_client_dns () {
 	echo "Select a DNS server for the client:"
-	echo "   1) Current system resolvers"
+	echo "   1) Default system resolvers"
 	echo "   2) Google"
 	echo "   3) 1.1.1.1"
 	echo "   4) OpenDNS"
 	echo "   5) Quad9"
 	echo "   6) AdGuard"
+	echo "   7) Specify custom resolvers"
 	read -p "DNS server [1]: " dns
-	until [[ -z "$dns" || "$dns" =~ ^[1-6]$ ]]; do
+	until [[ -z "$dns" || "$dns" =~ ^[1-7]$ ]]; do
 		echo "$dns: invalid selection."
 		read -p "DNS server [1]: " dns
 	done
-		# DNS
 	case "$dns" in
 		1|"")
 			# Locate the proper resolv.conf
 			# Needed for systems running systemd-resolved
-			if grep -q '^nameserver 127.0.0.53' "/etc/resolv.conf"; then
-				resolv_conf="/run/systemd/resolve/resolv.conf"
-			else
+			if grep '^nameserver' "/etc/resolv.conf" | grep -qv '127.0.0.53' ; then
 				resolv_conf="/etc/resolv.conf"
+			else
+				resolv_conf="/run/systemd/resolve/resolv.conf"
 			fi
 			# Extract nameservers and provide them in the required format
-			dns=$(grep -v '^#\|^;' "$resolv_conf" | grep '^nameserver' | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | xargs | sed -e 's/ /, /g')
+			dns=$(grep -v '^#\|^;' "$resolv_conf" | grep '^nameserver' | grep -v '127.0.0.53' | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | xargs | sed -e 's/ /, /g')
 		;;
 		2)
 			dns="8.8.8.8, 8.8.4.4"
@@ -133,6 +149,30 @@ new_client_dns () {
 		6)
 			dns="94.140.14.14, 94.140.15.15"
 		;;
+		7)
+			echo
+			until [[ -n "$custom_dns" ]]; do
+				echo "Enter DNS servers (one or more IPv4 addresses, separated by commas or spaces):"
+				read -p "DNS servers: " dns_input
+				# Convert comma delimited to space delimited
+				dns_input=$(echo "$dns_input" | tr ',' ' ')
+				# Validate and build custom DNS IP list
+				for dns_ip in $dns_input; do
+					if [[ "$dns_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+						if [[ -z "$custom_dns" ]]; then
+							custom_dns="$dns_ip"
+						else
+							custom_dns="$custom_dns, $dns_ip"
+						fi
+					fi
+				done
+				if [ -z "$custom_dns" ]; then
+					echo "Invalid input."
+				else
+					dns="$custom_dns"
+				fi
+			done
+		;;
 	esac
 }
 
@@ -140,7 +180,7 @@ new_client_setup () {
 	# Given a list of the assigned internal IPv4 addresses, obtain the lowest still
 	# available octet. Important to start looking at 2, because 1 is our gateway.
 	octet=2
-	while grep AllowedIPs /etc/wireguard/wg0.conf | cut -d "." -f 4 | cut -d "/" -f 1 | grep -q "$octet"; do
+	while grep AllowedIPs /etc/wireguard/wg0.conf | cut -d "." -f 4 | cut -d "/" -f 1 | grep -q "^$octet$"; do
 		(( octet++ ))
 	done
 	# Don't break the WireGuard configuration in case the address space is full
@@ -160,7 +200,7 @@ AllowedIPs = 10.7.0.$octet/32$(grep -q 'fddd:2c4:2c4:2c4::1' /etc/wireguard/wg0.
 # END_PEER $client
 EOF
 	# Create client configuration
-	cat << EOF > ~/"$client".conf
+	cat << EOF > "$script_dir"/"$client".conf
 [Interface]
 Address = 10.7.0.$octet/24$(grep -q 'fddd:2c4:2c4:2c4::1' /etc/wireguard/wg0.conf && echo ", fddd:2c4:2c4:2c4::$octet/64")
 DNS = $dns
@@ -201,7 +241,7 @@ if [[ ! -e /etc/wireguard/wg0.conf ]]; then
 		[[ -z "$ip_number" ]] && ip_number="1"
 		ip=$(ip -4 addr | grep inet | grep -vE '127(\.[0-9]{1,3}){3}' | cut -d '/' -f 1 | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | sed -n "$ip_number"p)
 	fi
-	# If $ip is a private IP address, the server must be behind NAT
+	# If $ip is a private IP address, the server must be behind NAT
 	if echo "$ip" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
 		echo
 		echo "This server is behind NAT. What is the public IPv4 address or hostname?"
@@ -234,7 +274,7 @@ if [[ ! -e /etc/wireguard/wg0.conf ]]; then
 		ip6=$(ip -6 addr | grep 'inet6 [23]' | cut -d '/' -f 1 | grep -oE '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}' | sed -n "$ip6_number"p)
 	fi
 	echo
-	echo "What port should WireGuard listen to?"
+	echo "What port should WireGuard listen on?"
 	read -p "Port [51820]: " port
 	until [[ -z "$port" || "$port" =~ ^[0-9]+$ && "$port" -le 65535 ]]; do
 		echo "$port: invalid port."
@@ -244,15 +284,15 @@ if [[ ! -e /etc/wireguard/wg0.conf ]]; then
 	echo
 	echo "Enter a name for the first client:"
 	read -p "Name [client]: " unsanitized_client
-	# Allow a limited set of characters to avoid conflicts
-	client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
+	# Allow a limited length and set of characters to avoid conflicts
+	client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client" | cut -c-15)
 	[[ -z "$client" ]] && client="client"
 	echo
 	new_client_dns
 	# Set up automatic updates for BoringTun if the user is fine with that
-	if [[ "$is_container" -eq 0 ]]; then
+	if [[ "$use_boringtun" -eq 1 ]]; then
 		echo
-		echo "BoringTun will be installed to set up WireGuard in the system."
+		echo "BoringTun will be installed to set up WireGuard on the system."
 		read -p "Should automatic updates be enabled for it? [Y/n]: " boringtun_updates
 		until [[ "$boringtun_updates" =~ ^[yYnN]*$ ]]; do
 			echo "$remove: invalid selection."
@@ -283,51 +323,26 @@ if [[ ! -e /etc/wireguard/wg0.conf ]]; then
 	fi
 	read -n1 -r -p "Press any key to continue..."
 	# Install WireGuard
-	# If not running inside a container, set up the WireGuard kernel module
-	if [[ ! "$is_container" -eq 0 ]]; then
+	# If BoringTun is not required, set up with the WireGuard kernel module
+	if [[ "$use_boringtun" -eq 0 ]]; then
 		if [[ "$os" == "ubuntu" ]]; then
 			# Ubuntu
 			apt-get update
 			apt-get install -y wireguard qrencode $firewall
-		elif [[ "$os" == "debian" && "$os_version" -ge 11 ]]; then
-			# Debian 11 or higher
+		elif [[ "$os" == "debian" ]]; then
+			# Debian
 			apt-get update
 			apt-get install -y wireguard qrencode $firewall
-		elif [[ "$os" == "debian" && "$os_version" -eq 10 ]]; then
-			# Debian 10
-			if ! grep -qs '^deb .* buster-backports main' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then
-				echo "deb http://deb.debian.org/debian buster-backports main" >> /etc/apt/sources.list
-			fi
-			apt-get update
-			# Try to install kernel headers for the running kernel and avoid a reboot. This
-			# can fail, so it's important to run separately from the other apt-get command.
-			apt-get install -y linux-headers-"$(uname -r)"
-			# There are cleaner ways to find out the $architecture, but we require an
-			# specific format for the package name and this approach provides what we need.
-			architecture=$(dpkg --get-selections 'linux-image-*-*' | cut -f 1 | grep -oE '[^-]*$' -m 1)
-			# linux-headers-$architecture points to the latest headers. We install it
-			# because if the system has an outdated kernel, there is no guarantee that old
-			# headers were still downloadable and to provide suitable headers for future
-			# kernel updates.
-			apt-get install -y linux-headers-"$architecture"
-			apt-get install -y wireguard qrencode $firewall
-		elif [[ "$os" == "centos" && "$os_version" -eq 8 ]]; then
-			# CentOS 8
-			dnf install -y epel-release elrepo-release
-			dnf install -y kmod-wireguard wireguard-tools qrencode $firewall
-			mkdir -p /etc/wireguard/
-		elif [[ "$os" == "centos" && "$os_version" -eq 7 ]]; then
-			# CentOS 7
-			yum install -y epel-release https://www.elrepo.org/elrepo-release-7.el7.elrepo.noarch.rpm
-			yum install -y yum-plugin-elrepo
-			yum install -y kmod-wireguard wireguard-tools qrencode $firewall
-			mkdir -p /etc/wireguard/
+		elif [[ "$os" == "centos" ]]; then
+			# CentOS
+			dnf install -y epel-release
+			dnf install -y wireguard-tools qrencode $firewall
 		elif [[ "$os" == "fedora" ]]; then
 			# Fedora
 			dnf install -y wireguard-tools qrencode $firewall
 			mkdir -p /etc/wireguard/
 		fi
-	# Else, we are inside a container and BoringTun needs to be used
+	# Else, BoringTun needs to be used
 	else
 		# Install required packages
 		if [[ "$os" == "ubuntu" ]]; then
@@ -335,29 +350,15 @@ if [[ ! -e /etc/wireguard/wg0.conf ]]; then
 			apt-get update
 			apt-get install -y qrencode ca-certificates $cron $firewall
 			apt-get install -y wireguard-tools --no-install-recommends
-		elif [[ "$os" == "debian" && "$os_version" -ge 11 ]]; then
-			# Debian 11 or higher
+		elif [[ "$os" == "debian" ]]; then
+			# Debian
 			apt-get update
 			apt-get install -y qrencode ca-certificates $cron $firewall
 			apt-get install -y wireguard-tools --no-install-recommends
-		elif [[ "$os" == "debian" && "$os_version" -eq 10 ]]; then
-			# Debian 10
-			if ! grep -qs '^deb .* buster-backports main' /etc/apt/sources.list /etc/apt/sources.list.d/*.list; then
-				echo "deb http://deb.debian.org/debian buster-backports main" >> /etc/apt/sources.list
-			fi
-			apt-get update
-			apt-get install -y qrencode ca-certificates $cron $firewall
-			apt-get install -y wireguard-tools --no-install-recommends
-		elif [[ "$os" == "centos" && "$os_version" -eq 8 ]]; then
-			# CentOS 8
+		elif [[ "$os" == "centos" ]]; then
+			# CentOS
 			dnf install -y epel-release
 			dnf install -y wireguard-tools qrencode ca-certificates tar $cron $firewall
-			mkdir -p /etc/wireguard/
-		elif [[ "$os" == "centos" && "$os_version" -eq 7 ]]; then
-			# CentOS 7
-			yum install -y epel-release
-			yum install -y wireguard-tools qrencode ca-certificates tar $cron $firewall
-			mkdir -p /etc/wireguard/
 		elif [[ "$os" == "fedora" ]]; then
 			# Fedora
 			dnf install -y wireguard-tools qrencode ca-certificates tar $cron $firewall
@@ -429,24 +430,25 @@ EOF
 			ip6tables_path=$(command -v ip6tables-legacy)
 		fi
 		echo "[Unit]
-Before=network.target
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=$iptables_path -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
-ExecStart=$iptables_path -I INPUT -p udp --dport $port -j ACCEPT
-ExecStart=$iptables_path -I FORWARD -s 10.7.0.0/24 -j ACCEPT
-ExecStart=$iptables_path -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
-ExecStop=$iptables_path -D INPUT -p udp --dport $port -j ACCEPT
-ExecStop=$iptables_path -D FORWARD -s 10.7.0.0/24 -j ACCEPT
-ExecStop=$iptables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/wg-iptables.service
+ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
+ExecStart=$iptables_path -w 5 -I INPUT -p udp --dport $port -j ACCEPT
+ExecStart=$iptables_path -w 5 -I FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStart=$iptables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
+ExecStop=$iptables_path -w 5 -D INPUT -p udp --dport $port -j ACCEPT
+ExecStop=$iptables_path -w 5 -D FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStop=$iptables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/wg-iptables.service
 		if [[ -n "$ip6" ]]; then
-			echo "ExecStart=$ip6tables_path -t nat -A POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
-ExecStart=$ip6tables_path -I FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
-ExecStart=$ip6tables_path -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$ip6tables_path -t nat -D POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
-ExecStop=$ip6tables_path -D FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
-ExecStop=$ip6tables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/wg-iptables.service
+			echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
+ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
+ExecStart=$ip6tables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
+ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/wg-iptables.service
 		fi
 		echo "RemainAfterExit=yes
 [Install]
@@ -478,7 +480,7 @@ if [[ "$current" != "$latest" ]]; then
 		rm -f /usr/local/sbin/boringtun
 		mv "$xdir"/boringtun /usr/local/sbin/boringtun
 		systemctl start wg-quick@wg0.service
-		echo "Succesfully updated to $(/usr/local/sbin/boringtun -V)"
+		echo "Successfully updated to $(/usr/local/sbin/boringtun -V)"
 	else
 		echo "boringtun update failed"
 	fi
@@ -492,26 +494,12 @@ EOF
 		{ crontab -l 2>/dev/null; echo "$(( $RANDOM % 60 )) $(( $RANDOM % 3 + 3 )) * * * /usr/local/sbin/boringtun-upgrade &>/dev/null" ; } | crontab -
 	fi
 	echo
-	qrencode -t UTF8 < ~/"$client.conf"
+	qrencode -t ANSI256UTF8 < "$script_dir"/"$client.conf"
 	echo -e '\xE2\x86\x91 That is a QR code containing the client configuration.'
 	echo
-	# If the kernel module didn't load, system probably had an outdated kernel
-	# We'll try to help, but will not will not force a kernel upgrade upon the user
-	if [[ ! "$is_container" -eq 0 ]] && ! modprobe -nq wireguard; then
-		echo "Warning!"
-		echo "Installation was finished, but the WireGuard kernel module could not load."
-		if [[ "$os" == "ubuntu" && "$os_version" -eq 1804 ]]; then
-		echo 'Upgrade the kernel and headers with "apt-get install linux-generic" and restart.'
-		elif [[ "$os" == "debian" && "$os_version" -eq 10 ]]; then
-		echo "Upgrade the kernel with \"apt-get install linux-image-$architecture\" and restart."
-		elif [[ "$os" == "centos" && "$os_version" -le 8 ]]; then
-			echo "Reboot the system to load the most recent kernel."
-		fi
-	else
-		echo "Finished!"
-	fi
+	echo "Finished!"
 	echo
-	echo "The client configuration is available in:" ~/"$client.conf"
+	echo "The client configuration is available in:" "$script_dir"/"$client.conf"
 	echo "New clients can be added by running this script again."
 else
 	clear
@@ -532,12 +520,12 @@ else
 			echo
 			echo "Provide a name for the client:"
 			read -p "Name: " unsanitized_client
-			# Allow a limited set of characters to avoid conflicts
-			client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
+			# Allow a limited lenght and set of characters to avoid conflicts
+			client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client" | cut -c-15)
 			while [[ -z "$client" ]] || grep -q "^# BEGIN_PEER $client$" /etc/wireguard/wg0.conf; do
 				echo "$client: invalid name."
 				read -p "Name: " unsanitized_client
-				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client")
+				client=$(sed 's/[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-]/_/g' <<< "$unsanitized_client" | cut -c-15)
 			done
 			echo
 			new_client_dns
@@ -545,10 +533,10 @@ else
 			# Append new client configuration to the WireGuard interface
 			wg addconf wg0 <(sed -n "/^# BEGIN_PEER $client/,/^# END_PEER $client/p" /etc/wireguard/wg0.conf)
 			echo
-			qrencode -t UTF8 < ~/"$client.conf"
+			qrencode -t ANSI256UTF8 < "$script_dir"/"$client.conf"
 			echo -e '\xE2\x86\x91 That is a QR code containing your client configuration.'
 			echo
-			echo "$client added. Configuration available in:" ~/"$client.conf"
+			echo "$client added. Configuration available in:" "$script_dir"/"$client.conf"
 			exit
 		;;
 		2)
@@ -621,27 +609,19 @@ else
 				systemctl disable --now wg-quick@wg0.service
 				rm -f /etc/systemd/system/wg-quick@wg0.service.d/boringtun.conf
 				rm -f /etc/sysctl.d/99-wireguard-forward.conf
-				# Different packages were installed if the system was containerized or not
-				if [[ ! "$is_container" -eq 0 ]]; then
+				# Different stuff was installed depending on whether BoringTun was used or not
+				if [[ "$use_boringtun" -eq 0 ]]; then
 					if [[ "$os" == "ubuntu" ]]; then
 						# Ubuntu
 						rm -rf /etc/wireguard/
 						apt-get remove --purge -y wireguard wireguard-tools
-					elif [[ "$os" == "debian" && "$os_version" -ge 11 ]]; then
-						# Debian 11 or higher
+					elif [[ "$os" == "debian" ]]; then
+						# Debian
 						rm -rf /etc/wireguard/
 						apt-get remove --purge -y wireguard wireguard-tools
-					elif [[ "$os" == "debian" && "$os_version" -eq 10 ]]; then
-						# Debian 10
-						rm -rf /etc/wireguard/
-						apt-get remove --purge -y wireguard wireguard-dkms wireguard-tools
-					elif [[ "$os" == "centos" && "$os_version" -eq 8 ]]; then
-						# CentOS 8
-						dnf remove -y kmod-wireguard wireguard-tools
-						rm -rf /etc/wireguard/
-					elif [[ "$os" == "centos" && "$os_version" -eq 7 ]]; then
-						# CentOS 7
-						yum remove -y kmod-wireguard wireguard-tools
+					elif [[ "$os" == "centos" ]]; then
+						# CentOS
+						dnf remove -y wireguard-tools
 						rm -rf /etc/wireguard/
 					elif [[ "$os" == "fedora" ]]; then
 						# Fedora
@@ -654,21 +634,13 @@ else
 						# Ubuntu
 						rm -rf /etc/wireguard/
 						apt-get remove --purge -y wireguard-tools
-					elif [[ "$os" == "debian" && "$os_version" -ge 11 ]]; then
-						# Debian 11 or higher
+					elif [[ "$os" == "debian" ]]; then
+						# Debian
 						rm -rf /etc/wireguard/
 						apt-get remove --purge -y wireguard-tools
-					elif [[ "$os" == "debian" && "$os_version" -eq 10 ]]; then
-						# Debian 10
-						rm -rf /etc/wireguard/
-						apt-get remove --purge -y wireguard-tools
-					elif [[ "$os" == "centos" && "$os_version" -eq 8 ]]; then
-						# CentOS 8
+					elif [[ "$os" == "centos" ]]; then
+						# CentOS
 						dnf remove -y wireguard-tools
-						rm -rf /etc/wireguard/
-					elif [[ "$os" == "centos" && "$os_version" -eq 7 ]]; then
-						# CentOS 7
-						yum remove -y wireguard-tools
 						rm -rf /etc/wireguard/
 					elif [[ "$os" == "fedora" ]]; then
 						# Fedora
